@@ -24,6 +24,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_wide import causal_conv1d_wide
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -218,6 +219,8 @@ class ShortConv(MambaBase, PluggableLayer):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
     ):
+        if self.L_cache > 4:
+            return self._forward_cuda_wide(hidden_states, output)
         forward_context = get_forward_context()
         # ShortConvAttentionMetadata contains metadata necessary for the
         # short_conv triton kernels to operate in continuous batching and in
@@ -339,6 +342,53 @@ class ShortConv(MambaBase, PluggableLayer):
 
         # Final linear projection
         output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+
+    def _forward_cuda_wide(self, hidden_states: torch.Tensor, output: torch.Tensor):
+        # the fused kernels unroll widths up to 4; wider kernels take the generic path
+        attn_metadata_raw = get_forward_context().attn_metadata
+        attn_metadata: AttentionMetadata | None = None
+        if attn_metadata_raw is not None:
+            assert isinstance(attn_metadata_raw, dict)
+            attn_metadata = attn_metadata_raw.get(self.prefix)
+        BCx, _ = self.in_proj(hidden_states)
+        B, C, x = BCx.chunk(3, dim=-1)
+        if attn_metadata is None:
+            contextualized_states, _ = self.out_proj(C * (B * x))
+            return contextualized_states
+        assert isinstance(attn_metadata, ShortConvAttentionMetadata)
+        if attn_metadata.num_accepted_tokens is not None:
+            raise NotImplementedError(
+                "Wide short convolutions do not support speculative decoding"
+            )
+        conv_state = self.kv_cache[0]
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        num_decodes = attn_metadata.num_decode_tokens
+        num_actual_tokens = num_decodes + attn_metadata.num_prefill_tokens
+        Bx = (B * x)[:num_actual_tokens]
+        weight = self.conv.weight[:, 0, :]
+        conv_output = torch.empty_like(Bx)
+        if attn_metadata.num_prefill_tokens:
+            conv_output[num_decodes:] = causal_conv1d_wide(
+                Bx[num_decodes:],
+                weight,
+                self.conv.bias,
+                conv_state,
+                attn_metadata.state_indices_tensor_p,
+                attn_metadata.query_start_loc_p,
+                attn_metadata.has_initial_states_p,
+            )
+        if num_decodes:
+            conv_output[:num_decodes] = causal_conv1d_wide(
+                Bx[:num_decodes],
+                weight,
+                self.conv.bias,
+                conv_state,
+                attn_metadata.state_indices_tensor_d,
+            )
+        output[:num_actual_tokens], _ = self.out_proj(
+            C[:num_actual_tokens] * conv_output
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None
